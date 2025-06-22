@@ -7,8 +7,12 @@ set -eux
 
 g++ -fopenmp -std=c++11 -O3 -o rccl-log-post-process rccl-log-post-process.cpp
 
-taskset -c 0-63 ./rccl-log-post-process rccl-log-64.data rccl-log-64.json
-taskset -c 0-63 xz -T8 --keep rccl-log-64.json
+input=rccl-log-64
+
+taskset -c 0-63 ./rccl-log-post-process $input.data $input.json
+
+rm -rf $input.json.xz
+taskset -c 0-63 xz -T8 --keep $input.json
 
 exit 0
 #endif
@@ -21,6 +25,7 @@ exit 0
 #include <cassert>
 #include <sstream>
 #include <limits>
+#include <algorithm>
 
 #include "rccl-log-loader.h"
 
@@ -48,7 +53,7 @@ const char * txt_entry = R"E0E1(
     "ph": "X", "cat": "rccl_op", "name": "%s", "pid": %u, "tid": %u,
     "ts": %lf, "dur": %lf,
     "args": {
-      "opcount": %u, "type": %u, "count": %lu, "ranks": [%s]
+      "opcount": %u, "type": "%s", "count": %lu, "kB": %.3f, "GB/s": %.3f, "ranks": [%s]
     }
   },
 )E0E1";
@@ -57,7 +62,7 @@ const char * txt_process_label = R"E0E1(
   {
     "name": "process_name", "ph": "M", "ts": 0.0, "pid": %u, "tid": 0,
     "args": {
-      "name": "%s"
+      "name": "Communicator %u"
     }
   },
 )E0E1";
@@ -82,7 +87,7 @@ const char * txt_footer = R"E0E1(
 int main (int argc, char *argv[]) {
 
     if (argc < 3) {
-        printf("File not specified\n");
+        printf("File not specified. Execute as: ./rccl-log-post-process input-file.data output-file.json\n");
         exit(-1);
     }
 
@@ -104,8 +109,10 @@ int main (int argc, char *argv[]) {
 
     // Map from comms hash to global rank
     typedef std::vector<unsigned> global_rank_ty;
+
     std::map<size_t,global_rank_ty> comm_hash_to_global_rank;
     std::map<size_t,std::string> comm_hash_to_global_rank_str;
+    std::map<size_t,unsigned> comm_hash_to_global_rank_sort;
 
     std::vector<rank_obj> rank_data;
     for(unsigned r = 0; r<nranks; ++r) {
@@ -135,15 +142,109 @@ int main (int argc, char *argv[]) {
 
     fclose(fp);
 
+    // Select an order for the communicators:
+    // - per number of ranks 
+    // - per the first rank of the communicator
+    size_t first_comm = 0;
+    {
+        unsigned ncomms = comm_hash_to_global_rank.size();
+        std::vector<size_t> comm_hash;
+        for(auto &m : comm_hash_to_global_rank)
+            comm_hash.push_back(m.first);
+
+        std::sort(comm_hash.begin(),comm_hash.end(),[&comm_hash_to_global_rank](size_t a, size_t b){
+
+            if (a == b)
+                return false;
+
+            auto &ma = comm_hash_to_global_rank[a];
+            auto &mb = comm_hash_to_global_rank[b];
+
+            if (ma.size() > mb.size())
+                return true;
+
+            for(unsigned i=0; i<ma.size(); ++i){
+                if (ma[i] < mb[i])
+                    return true;
+            }
+
+            return false;
+        });
+
+        first_comm = comm_hash.front();
+
+        unsigned i = 0;
+        for(auto c: comm_hash)
+            comm_hash_to_global_rank_sort[c] = ++i;
+    }
+
+    // If we have a communicator for all ranks, let's use the first op to calculate deviation between timmings.
+    // We use a linear interpolation betwen the first and last op.
+
+    std::vector<std::pair<double,double>> deviation(nranks, {0.0, 0.0});
+    if (first_comm && comm_hash_to_global_rank[first_comm].size() ==  nranks) {
+
+        double t1i=0.0, t1e=0.0;
+        unsigned opi=0, ope=0;
+
+        {
+            auto &rd = rank_data.front();
+            for(auto &o: rd.ops) {
+
+                if (rd.comms_address_to_hash[o.comm] != first_comm)
+                    continue;
+
+                if (o.opcount < 1)
+                    continue;
+
+                if (strstr(o.collname, "AllReduce")  == nullptr)
+                    continue;
+                    
+                if (opi == 0) {
+                    opi = o.opcount;
+                    t1i = o.te;
+                }
+
+                ope = o.opcount;
+                t1e = o.te;
+            }
+        }
+
+        if(opi && ope && opi != ope) {
+            for (auto &rd : rank_data) {
+                if (rd.rank == 0)
+                    continue;
+
+                double t2i=0.0, t2e=0.0;
+
+                for (auto &o: rd.ops) {
+                    if (o.opcount == opi) t2i = o.te;
+                    if (o.opcount == ope) t2e = o.te;
+                }
+
+                printf("%lf-%lf %lf-%lf\n", t2e, t2i, t1e, t1i);
+
+                double a = t2i-t1i;
+                double b = t2e-t1e;
+                double x1 = (b-a)/(t2e-t2i);
+                double x2 = a - t2i*(b-a)/(t2e-t2i);
+
+                printf("%lf %lf\n", x1*t2i+x2, t2i - (x1*t2i+x2));
+                deviation[rd.rank] = {x1, x2};
+                break;
+            }
+        }
+    }
+
+    // Generate the strings with lists of ranks per communicator.
     for (const auto& m : comm_hash_to_global_rank) {
         std::stringstream ss;
         for(unsigned r : m.second)
             ss << r << ",";
 
         comm_hash_to_global_rank_str[m.first] = ss.str();
-        printf("Comm info 0x%lx --> [%s]\n", m.first, ss.str().c_str());
+        //printf("Comm [%u] info 0x%lx --> [%s]\n", comm_hash_to_global_rank_sort[m.first], m.first, ss.str().c_str());
     }
-
 
     fp = nullptr;
     if(!(fp = fopen(argv[2],"w"))) {
@@ -157,35 +258,50 @@ int main (int argc, char *argv[]) {
         for(auto &o: rd.ops) {
 
             bool invalid_ts = o.ts <= 0.0 || o.ts >= std::numeric_limits<double>::max();
-            bool invalid_te = o.te <= 0.0 || o.ts <= std::numeric_limits<double>::min();
+            bool invalid_te = o.te <= 0.0 || o.te <= std::numeric_limits<double>::min();
 
             if(invalid_ts || invalid_te)
                 continue;
 
+            size_t comm_hash = rd.comms_address_to_hash[o.comm];
+
+            auto &dev_par = deviation[rd.rank];
+            double dev_ts = dev_par.first * o.ts + dev_par.second;
+            double dev_te = dev_par.first * o.te + dev_par.second;
+
+            double ts = (o.ts - dev_ts)*1e6;
+            double te = (o.te - dev_te)*1e6; 
+            double dur = te-ts;
+            double bytes = (double)o.count*rccl_type_to_bytes(o.datatype);
+
             fprintf(fp,
                 txt_entry, 
                 /*name*/ o.collname,
-                /*pid*/ 1,
-                /*tid*/ rd.rank+1,
-                /*ts*/ o.ts*1e6,
-                /*dur*/ (o.te-o.ts)*1e6,
+                /*pid*/ comm_hash_to_global_rank_sort[comm_hash],
+                /*tid*/ rd.rank,
+                /*ts*/ ts,
+                /*dur*/ dur,
                 /*opcount*/ o.opcount,
-                /*type*/ o.datatype,
+                /*type*/ rccl_type_to_str(o.datatype),
                 /*count*/ o.count,
-                /*ranks*/ comm_hash_to_global_rank_str[rd.comms_address_to_hash[o.comm]].c_str());
+                /*kB*/ bytes*1e-3,
+                /*GB/s*/ bytes/(dur*1e3),
+                /*ranks*/ comm_hash_to_global_rank_str[comm_hash].c_str());
         }
 
-        fprintf(fp,
-                txt_thread_label,
-                /*pid*/ 1,
-                /*tid*/ rd.rank+1,
-                /*rank*/ rd.rank);
+        // fprintf(fp,
+        //         txt_thread_label,
+        //         /*pid*/ 1,
+        //         /*tid*/ rd.rank+1,
+        //         /*rank*/ rd.rank);
     }
 
-    fprintf(fp,
-            txt_process_label,
-            /*pid*/ 1,
-            /*name*/ "main RCCL process");
+    for (const auto& m : comm_hash_to_global_rank_sort)
+        fprintf(fp,
+                txt_process_label,
+                /*pid*/ m.second,
+                /*comm idx*/ m.second);
+
     fprintf(fp,txt_footer);
 
     fclose(fp);

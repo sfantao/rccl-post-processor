@@ -3,6 +3,44 @@
 #define STR_MAX_COLLNAME 16
 #define STR_MAX_KERNELNAME 64
 
+static unsigned rccl_type_to_bytes(unsigned type) {
+    switch(type) {
+        case 0: return 1;
+        case 1: return 1;
+        case 2: return 4;
+        case 3: return 4;
+        case 4: return 8;
+        case 5: return 8;
+        case 6: return 2;
+        case 7: return 4;
+        case 8: return 8;
+        case 9: return 2;
+        case 10: return 1;
+        case 11: return 1;
+    }
+    assert(false);
+    return -1u;
+}
+
+static const char* rccl_type_to_str(unsigned type) {
+    switch(type) {
+        case 0: return "ncclInt8";
+        case 1: return "ncclUint8";
+        case 2: return "ncclInt32";
+        case 3: return "ncclUint32";
+        case 4: return "ncclInt64";
+        case 5: return "ncclUint64";
+        case 6: return "ncclFloat16";
+        case 7: return "ncclFloat32";
+        case 8: return "ncclFloat64";
+        case 9: return "ncclBfloat16";
+        case 10: return "ncclFp8E4M3";
+        case 11: return "ncclFp8E5M2";
+    }
+    assert(false);
+    return nullptr;
+}
+
 enum op_type {
     OP_TYPE_COLL = 0,
     OP_TYPE_SEND = 1,
