@@ -179,59 +179,20 @@ int main (int argc, char *argv[]) {
     }
 
     // If we have a communicator for all ranks, let's use the first op to calculate deviation between timmings.
-    // We use a linear interpolation betwen the first and last op.
-
-    std::vector<std::pair<double,double>> deviation(nranks, {0.0, 0.0});
+    std::vector<double> deviation(nranks, 0.0);
     if (first_comm && comm_hash_to_global_rank[first_comm].size() ==  nranks) {
 
-        double t1i=0.0, t1e=0.0;
-        unsigned opi=0, ope=0;
+        double te = 0.0;
 
-        {
-            auto &rd = rank_data.front();
+        for(auto &rd: rank_data) {
             for(auto &o: rd.ops) {
-
-                if (rd.comms_address_to_hash[o.comm] != first_comm)
-                    continue;
-
-                if (o.opcount < 1)
-                    continue;
-
-                if (strstr(o.collname, "AllReduce")  == nullptr)
-                    continue;
-                    
-                if (opi == 0) {
-                    opi = o.opcount;
-                    t1i = o.te;
+                if (rd.comms_address_to_hash[o.comm] == first_comm && o.opcount == 1) {
+                    if (rd.rank == 0)
+                        te = o.te;
+                    else
+                        deviation[rd.rank] = o.te - te;
+                    break;
                 }
-
-                ope = o.opcount;
-                t1e = o.te;
-            }
-        }
-
-        if(opi && ope && opi != ope) {
-            for (auto &rd : rank_data) {
-                if (rd.rank == 0)
-                    continue;
-
-                double t2i=0.0, t2e=0.0;
-
-                for (auto &o: rd.ops) {
-                    if (o.opcount == opi) t2i = o.te;
-                    if (o.opcount == ope) t2e = o.te;
-                }
-
-                printf("%lf-%lf %lf-%lf\n", t2e, t2i, t1e, t1i);
-
-                double a = t2i-t1i;
-                double b = t2e-t1e;
-                double x1 = (b-a)/(t2e-t2i);
-                double x2 = a - t2i*(b-a)/(t2e-t2i);
-
-                printf("%lf %lf\n", x1*t2i+x2, t2i - (x1*t2i+x2));
-                deviation[rd.rank] = {x1, x2};
-                break;
             }
         }
     }
@@ -243,7 +204,7 @@ int main (int argc, char *argv[]) {
             ss << r << ",";
 
         comm_hash_to_global_rank_str[m.first] = ss.str();
-        //printf("Comm [%u] info 0x%lx --> [%s]\n", comm_hash_to_global_rank_sort[m.first], m.first, ss.str().c_str());
+        printf("Comm [%u] info 0x%lx --> [%s]\n", comm_hash_to_global_rank_sort[m.first], m.first, ss.str().c_str());
     }
 
     fp = nullptr;
@@ -258,20 +219,15 @@ int main (int argc, char *argv[]) {
         for(auto &o: rd.ops) {
 
             bool invalid_ts = o.ts <= 0.0 || o.ts >= std::numeric_limits<double>::max();
-            bool invalid_te = o.te <= 0.0 || o.te <= std::numeric_limits<double>::min();
+            bool invalid_te = o.te <= 0.0 || o.ts <= std::numeric_limits<double>::min();
 
             if(invalid_ts || invalid_te)
                 continue;
 
             size_t comm_hash = rd.comms_address_to_hash[o.comm];
 
-            auto &dev_par = deviation[rd.rank];
-            double dev_ts = dev_par.first * o.ts + dev_par.second;
-            double dev_te = dev_par.first * o.te + dev_par.second;
-
-            double ts = (o.ts - dev_ts)*1e6;
-            double te = (o.te - dev_te)*1e6; 
-            double dur = te-ts;
+            double ts = (o.ts - deviation[rd.rank])*1e6; 
+            double dur = (o.te-o.ts)*1e6;
             double bytes = (double)o.count*rccl_type_to_bytes(o.datatype);
 
             fprintf(fp,
